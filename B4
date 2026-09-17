@@ -1,0 +1,59 @@
+PHẦN 1 – THIẾT KẾ LUỒNG PHÂN LOẠI LỖI
+1. Sơ đồ tư duy (Lưu đồ thuật toán)
+
+Plaintext
+[Request gọi sang Promo-Service]
+               │
+               ▼
+      [Thực thi lời gọi API]
+               │
+       ┌───────┴───────┐
+       ▼               ▼
+  [Thành công]      [Xảy ra Ngoại lệ / Exception]
+       │                       │
+       ▼                       ▼
+(Ghi nhận SUCCESS)    <Phân loại Exception>
+                               │
+            ┌──────────────────┴──────────────────┐
+            ▼                                     ▼
+   [Lỗi Nghiệp Vụ]                         [Lỗi Hệ Thống / Mạng]
+(VoucherNotFoundException, 404,        (TimeoutException, ConnectException,
+  InvalidCodeException, 400,...)         HttpServerErrorException 5xx,...)
+            │                                     │
+            ▼                                     ▼
+ [Circuit Breaker IGNORE]               [Circuit Breaker RECORD]
+- KHÔNG tính vào tỷ lệ lỗi             - Tính vào failureRateThreshold
+- Trả thông báo lỗi về cho Client      - Nếu tỷ lệ lỗi > ngưỡng -> Mở mạch (OPEN)
+2. Diễn giải nguyên lý thiết kế:
+
+Lỗi hệ thống (System Faults): Bản thân service đích gặp sự cố (chết server, nghẽn mạng, timeout). Đây là căn nguyên gây ra lỗi dây chuyền (Cascading Failure), do đó bắt buộc phải đưa vào recordExceptions để Circuit Breaker ngắt mạch kịp thời.
+
+Lỗi nghiệp vụ (Business Errors): Service đích vẫn hoàn toàn khỏe mạnh và xử lý đúng logic (người dùng nhập sai mã nên trả về 404). Lỗi này xuất phát từ phía Client, do đó bắt buộc phải đưa vào ignoreExceptions (hoặc loại khỏi danh sách ghi nhận lỗi) để tránh làm ngắt mạch oan uổng.
+
+PHẦN 2 – CẤU HÌNH APPLICATION.YML CHO PROMO-CLIENT
+YAML
+resilience4j:
+  circuitbreaker:
+    instances:
+      promoClient:
+        # Cấu hình cửa sổ trượt
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 20
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 20s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+
+        # 1. Các ngoại lệ BẮT BUỘC TÍNH vào tỷ lệ lỗi (Lỗi hệ thống / hạ tầng)
+        record-exceptions:
+          - java.util.concurrent.TimeoutException
+          - java.net.ConnectException
+          - java.io.IOException
+          - org.springframework.web.client.HttpServerErrorException  # Lỗi 5xx từ server
+
+        # 2. Các ngoại lệ CẦN PHỚT LỜ (Lỗi nghiệp vụ từ phía client)
+        ignore-exceptions:
+          - com.storex.checkout.exception.VoucherNotFoundException
+          - org.springframework.web.client.HttpClientErrorException.NotFound  # HTTP 404
+          - org.springframework.web.client.HttpClientErrorException.BadRequest # HTTP 400
